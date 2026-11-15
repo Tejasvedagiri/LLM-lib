@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# the `uv run build` tool (the "build/" rule above is for build output)
+!tools/build/
