@@ -5,10 +5,10 @@ import httpx2
 import pytest
 from conftest import Server, delta, sse
 
-from llm_lib import FailoverLLM, LLMUnavailable, Settings, is_retryable
+from llm_lib import FailoverLLM, LLMError, LLMUnavailable, Settings, is_retryable
 from llm_lib.errors import LLMContextExceeded, LLMStatusError
 from llm_lib.servers.capacity import effective_parallel, is_local_host, server_parallel
-from llm_lib.servers.lmstudio import LMStudio
+from llm_lib.servers.lmstudio import AsyncLMStudio, LMStudio
 
 
 def routes(table: dict[str, httpx2.Response]):
@@ -49,6 +49,49 @@ def test_lmstudio_rest_load_unloads_others_first():
     assert ("POST /api/v1/models/unload", {"instance_id": "qwen:1"}) in seen
     assert seen[-1] == ("POST /api/v1/models/load", {"model": "gemma", "context_length": 32768, "parallel": 1})
     assert lms.load("qwen", 40960, parallel=4)["already"]
+
+
+def test_async_lmstudio_loads_unloads_and_reads_the_context():
+    import asyncio
+
+    handler, seen = routes(
+        {
+            "GET /api/v1/models": httpx2.Response(200, json=V1_MODELS),
+            "GET /api/v0/models": httpx2.Response(
+                200, json={"data": [{"id": "gemma", "state": "not-loaded"}, {"id": "qwen", "state": "loaded"}]}
+            ),
+            "POST /api/v1/models/unload": httpx2.Response(200, json={}),
+            "POST /api/v1/models/load": httpx2.Response(200, json={"load_time_seconds": 3.2}),
+        }
+    )
+
+    async def run():
+        async with AsyncLMStudio("http://h:1234/v1", transport=httpx2.MockTransport(handler)) as lms:
+            assert [m["id"] for m in await lms.models()] == ["qwen", "gemma"]
+            assert await lms.loaded_context("qwen") == 40960
+            assert (await lms.load("qwen", 40960, parallel=4))["already"]
+            assert (await lms.load("gemma", 32768))["load_time_seconds"] == 3.2
+            assert ("POST /api/v1/models/unload", {"instance_id": "qwen:1"}) in seen
+            assert seen[-1] == ("POST /api/v1/models/load", {"model": "gemma", "context_length": 32768, "parallel": 1})
+            assert await lms.unload_all() == ["qwen"]
+
+    asyncio.run(run())
+
+
+def test_async_lmstudio_without_rest_api():
+    import asyncio
+
+    handler, _ = routes({})
+
+    async def run():
+        async with AsyncLMStudio("http://h:8080/v1", transport=httpx2.MockTransport(handler)) as lms:
+            assert await lms.models() == [] and await lms.loaded_context("m") is None
+            with pytest.raises(LLMError, match="REST API"):
+                await lms.load("m", 4096)
+            with pytest.raises(LLMError, match="REST API"):
+                await lms.unload_all()
+
+    asyncio.run(run())
 
 
 def test_client_loads_lmstudio_model_with_load_context_before_first_request():

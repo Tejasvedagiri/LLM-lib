@@ -5,7 +5,7 @@ context; `ensure_loaded` loads it with the context the app's prompts are sized f
 `unload_all` frees the GPU for another job (image or speech generation); `models_unloaded` does that
 for the length of a block and then puts every model back exactly as it was.
 
-Async apps: these calls are short and blocking; run them with `await asyncio.to_thread(...)`.
+`LMStudio` blocks; async apps use `AsyncLMStudio`, the same REST calls on an `httpx2.AsyncClient`.
 """
 
 from __future__ import annotations
@@ -46,6 +46,75 @@ def server_root(base_url: str) -> str:
     return re.sub(r"/v1/?$", "", base_url.rstrip("/"))
 
 
+def _sorted_models(data: Any) -> list[dict[str, Any]]:
+    """/api/v0/models -> its models, loaded ones first."""
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    out = [m for m in items if isinstance(m, dict) and "id" in m]
+    return sorted(out, key=lambda m: (m.get("state") != "loaded", str(m["id"]).lower()))
+
+
+def _instances(data: Any) -> list[dict[str, Any]]:
+    """/api/v1/models -> each loaded instance: key, type, instance_id, context_length, parallel."""
+    listed = data.get("models") if isinstance(data, dict) else None
+    out = []
+    for m in listed if isinstance(listed, list) else []:
+        for inst in m.get("loaded_instances") or []:
+            config = inst.get("config") or {}
+            out.append(
+                {
+                    "key": m.get("key"),
+                    "type": m.get("type"),
+                    "instance_id": inst.get("id"),
+                    "context_length": config.get("context_length"),
+                    "parallel": config.get("parallel") or 1,
+                }
+            )
+    return out
+
+
+def _context_of(model: str, instances: list[dict[str, Any]], state: dict[str, Any] | None) -> int | None:
+    for inst in instances:
+        n = inst.get("context_length")
+        if inst.get("key") == model and isinstance(n, int) and n > 0:
+            return n
+    state = state or {}
+    n = state.get("loaded_context_length") if state.get("state") == "loaded" else None
+    return n if isinstance(n, int) and n > 0 else None
+
+
+def _load_plan(
+    listed: list[dict[str, Any]], model: str, context_length: int, parallel: int, unload_others: bool
+) -> list[str] | None:
+    """The instance ids to unload before loading `model`, or None when it's loaded exactly so already."""
+    if not any(m.get("key") == model for m in listed):
+        raise LLMError(f"LM Studio has no model {model!r}")
+    unload = []
+    for m in listed:
+        for inst in m.get("loaded_instances") or []:
+            config = inst.get("config") or {}
+            if (
+                m.get("key") == model
+                and config.get("context_length") == context_length
+                and (config.get("parallel") or 1) == parallel
+            ):
+                return None
+            if unload_others and m.get("type") in ("llm", "vlm"):
+                unload.append(inst["id"])
+    return unload
+
+
+def _load_result(resp: httpx2.Response, model: str) -> dict[str, Any]:
+    body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    if resp.status_code >= 400:
+        raise LLMError(f"LM Studio couldn't load {model}: {body.get('error', resp.text[:300])}")
+    return {"status": "loaded", "model": model, "load_time_seconds": body.get("load_time_seconds")}
+
+
+NO_REST = "this server can't load models on request (LM Studio's REST API only)"
+
+
 class LMStudio:
     def __init__(
         self,
@@ -77,12 +146,7 @@ class LMStudio:
     def models(self) -> list[dict[str, Any]]:
         """Every downloaded model: id, type (llm / vlm / embeddings), state (loaded / not-loaded),
         arch, quantization, max_context_length, loaded_context_length. Loaded ones first."""
-        data = self._get("/api/v0/models")
-        items = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            return []
-        out = [m for m in items if isinstance(m, dict) and "id" in m]
-        return sorted(out, key=lambda m: (m.get("state") != "loaded", str(m["id"]).lower()))
+        return _sorted_models(self._get("/api/v0/models"))
 
     def model_state(self, model: str) -> dict[str, Any] | None:
         """LM Studio's view of one model (state, loaded_context_length, ...), None if unknown."""
@@ -91,32 +155,14 @@ class LMStudio:
 
     def loaded_instances(self) -> list[dict[str, Any]]:
         """Each loaded instance: key, type, instance_id, context_length, parallel."""
-        data = self._get("/api/v1/models")
-        listed = data.get("models") if isinstance(data, dict) else None
-        out = []
-        for m in listed if isinstance(listed, list) else []:
-            for inst in m.get("loaded_instances") or []:
-                config = inst.get("config") or {}
-                out.append(
-                    {
-                        "key": m.get("key"),
-                        "type": m.get("type"),
-                        "instance_id": inst.get("id"),
-                        "context_length": config.get("context_length"),
-                        "parallel": config.get("parallel") or 1,
-                    }
-                )
-        return out
+        return _instances(self._get("/api/v1/models"))
 
     def loaded_context(self, model: str) -> int | None:
         """The context length `model` is loaded with, or None: not loaded, not LM Studio, unreachable."""
-        for inst in self.loaded_instances():
-            n = inst.get("context_length")
-            if inst.get("key") == model and isinstance(n, int) and n > 0:
-                return n
-        state = self.model_state(model) or {}
-        n = state.get("loaded_context_length") if state.get("state") == "loaded" else None
-        return n if isinstance(n, int) and n > 0 else None
+        instances = self.loaded_instances()
+        if found := _context_of(model, instances, None):
+            return found
+        return _context_of(model, [], self.model_state(model))
 
     def load(self, model: str, context_length: int, *, parallel: int = 1, unload_others: bool = True) -> dict[str, Any]:
         """Load `model` over REST with this context and `parallel` slots (which share the context).
@@ -126,32 +172,20 @@ class LMStudio:
         except httpx2.HTTPError as exc:
             raise LLMError(f"cannot reach LM Studio at {self.root}: {exc}") from exc
         if resp.status_code >= 400:
-            raise LLMError("this server can't load models on request (LM Studio's REST API only)")
-        listed = resp.json().get("models", [])
-        if not any(m.get("key") == model for m in listed):
-            raise LLMError(f"LM Studio has no model {model!r}")
-        for m in listed:
-            for inst in m.get("loaded_instances") or []:
-                config = inst.get("config") or {}
-                if (
-                    m.get("key") == model
-                    and config.get("context_length") == context_length
-                    and (config.get("parallel") or 1) == parallel
-                ):
-                    return {"status": "loaded", "model": model, "already": True}
-                if unload_others and m.get("type") in ("llm", "vlm"):
-                    self._http.post(
-                        f"{self.root}/api/v1/models/unload", headers=self.headers, json={"instance_id": inst["id"]}
-                    )
+            raise LLMError(NO_REST)
+        plan = _load_plan(resp.json().get("models", []), model, context_length, parallel, unload_others)
+        if plan is None:
+            return {"status": "loaded", "model": model, "already": True}
+        for instance_id in plan:
+            self._http.post(
+                f"{self.root}/api/v1/models/unload", headers=self.headers, json={"instance_id": instance_id}
+            )
         resp = self._http.post(
             f"{self.root}/api/v1/models/load",
             headers=self.headers,
             json={"model": model, "context_length": context_length, "parallel": parallel},
         )
-        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-        if resp.status_code >= 400:
-            raise LLMError(f"LM Studio couldn't load {model}: {body.get('error', resp.text[:300])}")
-        return {"status": "loaded", "model": model, "load_time_seconds": body.get("load_time_seconds")}
+        return _load_result(resp, model)
 
     def unload_all(self) -> list[str]:
         """Unload every LLM to free the GPU; returns the keys that were loaded. Falls back to
@@ -297,3 +331,98 @@ class LMStudio:
 
     def close(self) -> None:
         self._http.close()
+
+
+class AsyncLMStudio:
+    """LMStudio's REST calls for async apps, on an `httpx2.AsyncClient` (nothing here blocks the
+    event loop). The `lms` CLI fallbacks and `models_unloaded` stay on the sync LMStudio."""
+
+    def __init__(
+        self,
+        base_url: str = DEFAULT_URL,
+        *,
+        api_key: str | None = None,
+        http: httpx2.AsyncClient | None = None,
+        transport: httpx2.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.root = server_root(base_url)
+        self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self._own = http is None
+        self._http = http or httpx2.AsyncClient(timeout=httpx2.Timeout(15.0, read=LOAD_TIMEOUT_S), transport=transport)
+
+    async def _get(self, path: str) -> Any:
+        try:
+            resp = await self._http.get(f"{self.root}{path}", headers=self.headers, timeout=10.0)
+            return resp.json() if resp.status_code < 400 else None
+        except (httpx2.HTTPError, ValueError):
+            return None
+
+    async def models(self) -> list[dict[str, Any]]:
+        """See LMStudio.models; [] when the server isn't LM Studio or can't be reached."""
+        return _sorted_models(await self._get("/api/v0/models"))
+
+    async def model_state(self, model: str) -> dict[str, Any] | None:
+        data = await self._get(f"/api/v0/models/{quote(model, safe='')}")
+        return data if isinstance(data, dict) else None
+
+    async def loaded_instances(self) -> list[dict[str, Any]]:
+        return _instances(await self._get("/api/v1/models"))
+
+    async def loaded_context(self, model: str) -> int | None:
+        if found := _context_of(model, await self.loaded_instances(), None):
+            return found
+        return _context_of(model, [], await self.model_state(model))
+
+    async def load(
+        self, model: str, context_length: int, *, parallel: int = 1, unload_others: bool = True
+    ) -> dict[str, Any]:
+        """See LMStudio.load."""
+        try:
+            resp = await self._http.get(f"{self.root}/api/v1/models", headers=self.headers)
+            if resp.status_code >= 400:
+                raise LLMError(NO_REST)
+            plan = _load_plan(resp.json().get("models", []), model, context_length, parallel, unload_others)
+            if plan is None:
+                return {"status": "loaded", "model": model, "already": True}
+            for instance_id in plan:
+                await self._http.post(
+                    f"{self.root}/api/v1/models/unload", headers=self.headers, json={"instance_id": instance_id}
+                )
+            resp = await self._http.post(
+                f"{self.root}/api/v1/models/load",
+                headers=self.headers,
+                json={"model": model, "context_length": context_length, "parallel": parallel},
+            )
+        except httpx2.HTTPError as exc:
+            raise LLMError(f"cannot reach LM Studio at {self.root}: {exc}") from exc
+        return _load_result(resp, model)
+
+    async def unload_all(self) -> list[str]:
+        """Unload every LLM over REST; returns the keys that were loaded. Raises when the server has
+        no REST API (use LMStudio.unload_all in a thread for the `lms` CLI fallback)."""
+        if await self._get("/api/v1/models") is None:
+            raise LLMError("this server can't unload models on request (LM Studio's REST API only)")
+        unloaded = []
+        for inst in await self.loaded_instances():
+            if inst.get("type") not in ("llm", "vlm"):
+                continue
+            try:
+                r = await self._http.post(
+                    f"{self.root}/api/v1/models/unload", headers=self.headers, json={"instance_id": inst["instance_id"]}
+                )
+            except httpx2.HTTPError as exc:
+                raise LLMError(f"cannot reach LM Studio at {self.root}: {exc}") from exc
+            if r.status_code >= 400:
+                raise LLMError(f"LM Studio couldn't unload {inst.get('key')}: {r.text[:300]}")
+            unloaded.append(inst["key"])
+        return unloaded
+
+    async def aclose(self) -> None:
+        if self._own:
+            await self._http.aclose()
+
+    async def __aenter__(self) -> AsyncLMStudio:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()

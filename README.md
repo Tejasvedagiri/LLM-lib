@@ -215,6 +215,10 @@ lms.models(); lms.loaded_context("qwen"); lms.load("qwen", 65536, parallel=2); l
 with lms.models_unloaded():   # lms CLI: unload all, run the step, reload each exactly as it was
     run_image_model()
 
+from llm_lib.servers.lmstudio import AsyncLMStudio   # the same REST calls for async apps
+async with AsyncLMStudio(url) as lms:
+    await lms.models(); await lms.loaded_context("qwen"); await lms.load("qwen", 65536, parallel=2); await lms.unload_all()
+
 from llm_lib.servers.capacity import effective_parallel
 workers, why = effective_parallel(4, settings, window=16384)   # LM Studio parallel, llama.cpp / colibri slots, ...
 

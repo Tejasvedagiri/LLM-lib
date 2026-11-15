@@ -62,7 +62,7 @@ send the placeholder `colibri`.
 | `_sampling(settings)` (temperature, top_p, top_k, min_p, repetition penalty, max_tokens) | `Settings` fields (same names; both repeat-penalty spellings are sent) |
 | `_post` 5xx waits `(2, 5, 10)`, "Context size has been exceeded" not retried | built in (`retry_waits`, `LLMContextExceeded`) |
 | `failover_settings` / `main_down_until` / `FAILOVER_RETRY_SECONDS` | `FailoverLLM(main, failover, primary_off=lambda: bool(paused_reason or unloaded))` |
-| `list_models`, `list_model_details`, `loaded_context`, `load_model`, `unload_models` | `llm.list_models()`, `LMStudio(url).models()`, `.loaded_context(m)`, `.load(m, ctx, parallel=p)`, `.unload_all()` (run them with `asyncio.to_thread`) |
+| `list_models`, `list_model_details`, `loaded_context`, `load_model`, `unload_models` | `AsyncLMStudio(url)`: `await .models()`, `.loaded_context(m)`, `.load(m, ctx, parallel=p)`, `.unload_all()`; `/v1/models` for other servers |
 | `api_base_url = "mock"` | `Settings(provider="mock", extra={"delay": 0.05})` |
 
 `ReplyParser` already splits out reasoning by the preset's own prefix/suffix (and the prefill), so
