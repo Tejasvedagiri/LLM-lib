@@ -262,10 +262,28 @@ class LLM:
             return False  # the request itself will say the server is down
         except (LLMError, ValueError):
             return True  # it answered, just not with a model list
+        self._use_only_model(models)
+        return True
+
+    def _use_only_model(self, models: list[str]) -> None:
         if len(models) == 1:
             self.settings = self.settings.with_(model=models[0])
             self._log(f"{self.label} serves one model, {models[0]}; using it")
-        return True
+
+    async def _asetup(self) -> None:
+        """_setup for the async client: the model is looked up on the async HTTP client (so its
+        transport is used and the event loop isn't held); only LM Studio's load goes to a thread."""
+        if not self.settings.model and self.settings.kind == "openai" and not self._model_checked:
+            try:
+                self._use_only_model(await self.alist_models())
+                self._model_checked = True
+            except LLMUnavailable:
+                pass  # asked again next time: the server may be starting up
+            except (LLMError, ValueError):
+                self._model_checked = True
+        s = self.settings
+        if s.provider == "lmstudio" and s.load_context and not self._load_checked:
+            await asyncio.to_thread(self._setup)
 
     def _log_dropped(self, call: HttpCall) -> None:
         new = [p for p in call.dropped if p not in self._dropped_logged]
@@ -481,7 +499,7 @@ class LLM:
     async def _astream(self, req: Request, cancel: Cancel | None) -> AsyncIterator[Event]:
         req = self._prepare(req)
         if self._needs_setup():
-            await asyncio.to_thread(self._setup)
+            await self._asetup()
         self._announce(req)
         post = _Post(self, req)
         events = self._araw_events(req)
@@ -530,31 +548,48 @@ class LLM:
 
     # ------------------------------------------------------------------ the server
 
-    def list_models(self) -> list[str]:
-        """Model ids the server offers."""
+    def _models_request(self) -> tuple[str, dict[str, str]]:
         s = self.settings
-        if s.kind == "mock":
-            return ["mock"]
-        if self._anthropic is not None:
-            return self._anthropic.list_models()
-        base = s.resolved_base_url()
         headers = dict(s.headers)
         if key := s.resolved_api_key():
             headers["Authorization"] = f"Bearer {key}"
-        try:
-            if s.kind == "ollama":
-                resp = self.http.get(f"{base}/api/tags", headers=headers, timeout=15.0)
-                if resp.status_code >= 400:
-                    raise status_error(self.label, resp.status_code, resp.text)
-                return sorted(m.get("name", "") for m in resp.json().get("models", []))
-            resp = self.http.get(f"{base}/models", headers=headers, timeout=15.0)
-        except httpx2.TransportError as exc:
-            raise _transport_error(exc, self.label, str(base)) from exc
+        base = s.resolved_base_url()
+        return (f"{base}/api/tags" if s.kind == "ollama" else f"{base}/models"), headers
+
+    def _models_of(self, resp: httpx2.Response) -> list[str]:
         if resp.status_code >= 400:
             raise status_error(self.label, resp.status_code, resp.text)
         data = resp.json()
+        if self.settings.kind == "ollama":
+            return sorted(m.get("name", "") for m in data.get("models", []))
         items = data.get("data", data) if isinstance(data, dict) else data
         return sorted(m["id"] for m in items if isinstance(m, dict) and "id" in m)
+
+    def list_models(self) -> list[str]:
+        """Model ids the server offers."""
+        if self.settings.kind == "mock":
+            return ["mock"]
+        if self._anthropic is not None:
+            return self._anthropic.list_models()
+        url, headers = self._models_request()
+        try:
+            resp = self.http.get(url, headers=headers, timeout=15.0)
+        except httpx2.TransportError as exc:
+            raise _transport_error(exc, self.label, url) from exc
+        return self._models_of(resp)
+
+    async def alist_models(self) -> list[str]:
+        """list_models on the async HTTP client."""
+        if self.settings.kind == "mock":
+            return ["mock"]
+        if self._anthropic is not None:
+            return await asyncio.to_thread(self._anthropic.list_models)
+        url, headers = self._models_request()
+        try:
+            resp = await self.async_http.get(url, headers=headers, timeout=15.0)
+        except httpx2.TransportError as exc:
+            raise _transport_error(exc, self.label, url) from exc
+        return self._models_of(resp)
 
     def available(self) -> bool:
         """The server is up and offers the configured model (cheap: one GET, for a health check)."""
