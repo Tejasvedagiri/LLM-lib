@@ -5,7 +5,7 @@ import httpx2
 import pytest
 from conftest import Server, delta, sse
 
-from llm_lib import LLMStatusError, Settings
+from llm_lib import LLM, LLMStatusError, Settings
 from llm_lib.servers.capacity import server_parallel
 from llm_lib.servers.colibri import Colibri, choice, noul, score
 
@@ -38,6 +38,28 @@ def test_model_is_taken_from_the_server_when_unset():
     bodies = [json.loads(r.content) for k, r in seen if k.startswith("POST")]
     assert all(b["model"] == "glm-5.3-flash-colibri" for b in bodies)
     assert any("serves one model" in line for line in lines)
+
+
+def test_async_client_looks_up_the_model_on_its_own_transport():
+    import asyncio
+
+    seen = []
+
+    def handler(request):  # fresh responses: an async client reads each one once
+        seen.append((f"{request.method} {request.url.path}", request))
+        return httpx2.Response(200, json=MODELS.json()) if request.method == "GET" else chat_ok()
+
+    # Only the async transport answers: a lookup on the sync client would fail to connect
+    llm = LLM(Settings(provider="colibri"), async_transport=httpx2.MockTransport(handler))
+
+    async def run():
+        assert await llm.acomplete("s", "p") == "ok"
+        assert await llm.acomplete("s", "p") == "ok"
+        await llm.aclose()
+
+    asyncio.run(run())
+    assert [k for k, _ in seen].count("GET /v1/models") == 1
+    assert all(json.loads(r.content)["model"] == "glm-5.3-flash-colibri" for k, r in seen if k.startswith("POST"))
 
 
 def test_penalties_are_left_out_and_said_once():
