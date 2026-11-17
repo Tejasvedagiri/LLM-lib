@@ -219,6 +219,9 @@ from llm_lib.servers.lmstudio import AsyncLMStudio   # the same REST calls for a
 async with AsyncLMStudio(url) as lms:
     await lms.models(); await lms.loaded_context("qwen"); await lms.load("qwen", 65536, parallel=2); await lms.unload_all()
 
+from llm_lib.servers.detect import adetect_server, detect_server
+provider = await adetect_server(url, api_key=key)   # "colibri", "lmstudio" or "openai-compatible", from /v1/models
+
 from llm_lib.servers.capacity import effective_parallel
 workers, why = effective_parallel(4, settings, window=16384)   # LM Studio parallel, llama.cpp / colibri slots, ...
 
