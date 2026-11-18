@@ -44,6 +44,9 @@ class Preset:
     retry_waits: tuple[float, ...] = DEFAULT_RETRY_WAITS  # resends after a 5xx
     rate_limit_retries: int = 3  # resends after a 429, each after its Retry-After
     drop_params: frozenset[str] = frozenset()  # body fields the server refuses with a 400
+    # Most stop strings the server takes on /completions (chat always gets at most 4, as OpenAI requires);
+    # None = no limit. Callers that need every stop string cut the reply themselves.
+    max_stops: int | None = None
     # How Settings.thinking reaches the server: "enable_thinking" (colibri's extension),
     # "chat_template_kwargs" (vLLM, SGLang, llama.cpp: the template's own enable_thinking), or None
     thinking_param: str | None = None
@@ -95,6 +98,7 @@ PRESETS: dict[str, Preset] = {
         retry_waits=(),
         rate_limit_retries=10,
         drop_params=PENALTIES,  # "Token penalties are not supported yet." -- HTTP 400
+        max_stops=4,  # "`stop` must contain between 1 and 4 sequences." -- HTTP 400, on /completions too
         thinking_param="enable_thinking",
         local=True,
     ),
