@@ -46,7 +46,7 @@ class OpenAIProvider:
             url = f"{base}/completions"
             body["prompt"] = req.prompt
             if req.stop:
-                body["stop"] = req.stop
+                body["stop"] = req.stop[: settings.preset.max_stops]
         else:
             url = f"{base}/chat/completions"
             body["messages"] = req.messages or []

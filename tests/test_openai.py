@@ -120,6 +120,16 @@ def test_text_completion_mode():
     assert server.bodies()[0]["prompt"] == "### Story:\n"
 
 
+def test_text_completion_stops_capped_where_the_server_limits_them():
+    stops = ["\nUser:", "\nAnn:", "<|im_end|>", "###", "</s>", "\nBob:"]
+    server = Server(ok(sse({"choices": [{"text": "x"}]})), ok(sse({"choices": [{"text": "x"}]})))
+    server.client(Settings(provider="colibri", base_url="http://c/v1", model="m")).complete_text("p", stop=stops)
+    server.client(LMS).complete_text("p", stop=stops)
+    colibri, lms = server.bodies()
+    assert colibri["stop"] == stops[:4]  # colibri: "`stop` must contain between 1 and 4 sequences."
+    assert lms["stop"] == stops
+
+
 def test_no_think_switch_on_last_user_message():
     server = Server(ok(sse(delta(content="x"))))
     server.client(LMS.with_(no_think=True)).complete("s", "p")
